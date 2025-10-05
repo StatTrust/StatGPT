@@ -1,0 +1,7 @@
+{
+  "functions": { "api/*.py": { "runtime": "python3.11" } },
+  "routes": [
+    { "src": "/healthz", "dest": "/api/healthz.py" },
+    { "src": "/chat", "dest": "/api/chat.py" }
+  ]
+}
