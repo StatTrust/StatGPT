@@ -1,9 +1,8 @@
 #!/usr/bin/env node
 /**
  * Robust pass: messy compiled JSON -> clean v1 schema skeleton (+ Money Line Movement).
- * - Recursively searches for money line history anywhere in the JSON.
- * - Recursively searches for range arrays (price_label_1/price_1 pairs).
- * - Parses team moneyline columns dynamically (e.g., PIT/BUF, away/home).
+ * - Uses exact paths you discovered, with fallbacks.
+ * - Only picks range arrays from moneylinemovement (ignores pointspread/overunder).
  *
  * Usage:
  *   node docs/scripts/convert-compiled-nfl.js <input.json> <output.json> <HOME_ABBR> <AWAY_ABBR> [SEASON_YEAR]
@@ -26,9 +25,7 @@ function parseMoney(val) {
   if (val == null) return null;
   if (typeof val === 'number') return val;
   if (typeof val === 'string') {
-    const trimmed = val.trim();
-    // "+233", "-267", maybe quoted numbers
-    const n = parseInt(trimmed.replace(/\s/g, ''), 10);
+    const n = parseInt(val.trim().replace(/\s/g, ''), 10);
     return Number.isNaN(n) ? null : n;
   }
   return null;
@@ -39,16 +36,13 @@ function monthToNum(m) {
   return map[m] || null;
 }
 
-// Try to parse strings like "Sep 12 1:02 PM" or "09/12 01:05 PM" using a season year.
 function parseToISO(label, seasonYear) {
   if (!label || typeof label !== 'string') return null;
   if (/^\d{4}-\d{2}-\d{2}T/.test(label)) return label;
-
   try {
     let year = parseInt(seasonYear, 10);
     if (!year || Number.isNaN(year)) year = new Date().getUTCFullYear();
 
-    // "Sep 12 1:02 PM"
     const a = label.match(/^([A-Za-z]{3})\s+(\d{1,2})\s+(\d{1,2}):(\d{2})\s*(AM|PM)$/);
     if (a) {
       const mon = monthToNum(a[1]);
@@ -60,7 +54,6 @@ function parseToISO(label, seasonYear) {
       return new Date(Date.UTC(year, mon - 1, parseInt(a[2], 10), hh, mm, 0)).toISOString();
     }
 
-    // "09/12 01:05 PM"
     const b = label.match(/^(\d{2})\/(\d{2})\s+(\d{2}):(\d{2})\s*(AM|PM)$/);
     if (b) {
       const mon = parseInt(b[1], 10);
@@ -72,80 +65,38 @@ function parseToISO(label, seasonYear) {
       if (ampm === 'AM' && hh === 12) hh = 0;
       return new Date(Date.UTC(year, mon - 1, day, hh, mm, 0)).toISOString();
     }
-
     return null;
   } catch {
     return null;
   }
 }
 
-// Helpers to search the entire object graph
-function walk(obj, fn, path = []) {
+function walk(obj, fn, pathArr = []) {
   if (!obj || typeof obj !== 'object') return;
-  fn(obj, path);
+  fn(obj, pathArr);
   if (Array.isArray(obj)) {
-    obj.forEach((v, i) => walk(v, fn, path.concat([i])));
+    obj.forEach((v, i) => walk(v, fn, pathArr.concat([i])));
   } else {
-    Object.keys(obj).forEach(k => walk(obj[k], fn, path.concat([k])));
+    for (const k of Object.keys(obj)) walk(obj[k], fn, pathArr.concat([k]));
   }
 }
 
-function keyIncludesAny(key, regexes) {
-  const s = String(key).toLowerCase();
-  return regexes.some(rx => rx.test(s));
-}
-
-function findMoneyLineHistory(root) {
-  // Find an array whose parent key looks like "money line history"
-  // Example key variants: "Money Line History", "moneylinehistory", "money line history"
-  const matches = [];
-  walk(root, (node, path) => {
-    if (!Array.isArray(node)) return;
-    const lastKey = String(path[path.length - 1] ?? '').toLowerCase();
-    if (/(^|[^a-z])money\s*line([^a-z]|$)/i.test(lastKey) && /history/i.test(lastKey)) {
-      matches.push({ path, arr: node });
-    }
-  });
-  // If none found, try to find any array of objects that has both team columns and a "time stamp"/"timestamp"/"label"
-  if (matches.length === 0) {
-    walk(root, (node, path) => {
-      if (!Array.isArray(node)) return;
-      const first = node.find(v => v && typeof v === 'object');
-      if (!first) return;
-      const keys = Object.keys(first);
-      const hasLabel = keys.some(k => /^(time stamp|timestamp|label)$/i.test(k));
-      // at least two non-label columns (teams)
-      const teamCols = keys.filter(k => !/^(time stamp|timestamp|label)$/i.test(k));
-      if (hasLabel && teamCols.length >= 2) {
-        matches.push({ path, arr: node });
-      }
-    });
+function get(obj, pathArr, def = undefined) {
+  try {
+    return pathArr.reduce((o, k) => (o && o[k] !== undefined ? o[k] : undefined), obj) ?? def;
+  } catch {
+    return def;
   }
-  return matches[0]?.arr || null;
-}
-
-function findRangeArrays(root) {
-  // Arrays containing objects with price_label_1/price_1 pairs
-  const rangeArrays = [];
-  walk(root, (node, path) => {
-    if (!Array.isArray(node)) return;
-    const first = node.find(v => v && typeof v === 'object');
-    if (!first) return;
-    const keys = Object.keys(first);
-    const hasPrice = keys.some(k => /^price_?label_?1$/i.test(k) || /^price_?1$/i.test(k));
-    if (hasPrice) rangeArrays.push({ path, arr: node });
-  });
-  return rangeArrays.map(x => x.arr);
 }
 
 function detectTeamKeys(rec, preferredHome, preferredAway) {
   const ignore = new Set(['time stamp', 'timestamp', 'label']);
   const keys = Object.keys(rec || {}).filter(k => !ignore.has(k));
-  // Use provided abbreviations if present
-  if (preferredHome && keys.includes(preferredHome)) {
-    if (preferredAway && keys.includes(preferredAway)) return { homeKey: preferredHome, awayKey: preferredAway };
-  }
-  // Otherwise, just pick first two keys; later we will assign inferred[1] => home, inferred[0] => away
+  // Prefer provided abbreviations
+  const hasHome = preferredHome && keys.includes(preferredHome);
+  const hasAway = preferredAway && keys.includes(preferredAway);
+  if (hasHome && hasAway) return { homeKey: preferredHome, awayKey: preferredAway };
+  // Fallback: pick first two, map [0] => away, [1] => home consistently
   if (keys.length >= 2) return { homeKey: keys[1], awayKey: keys[0] };
   return { homeKey: null, awayKey: null };
 }
@@ -156,6 +107,7 @@ function extractMoneyLineHistory(arr, preferredHome, preferredAway, seasonYear) 
   let keysChosen = null;
 
   for (const rec of arr) {
+    if (!rec || typeof rec !== 'object') continue;
     if (!keysChosen) keysChosen = detectTeamKeys(rec, preferredHome, preferredAway);
     const label = rec['time stamp'] ?? rec['timestamp'] ?? rec['label'] ?? '';
     const timestamp = parseToISO(label, seasonYear);
@@ -168,8 +120,6 @@ function extractMoneyLineHistory(arr, preferredHome, preferredAway, seasonYear) 
 }
 
 function reduceRange(records) {
-  // Combine open/high/low/last from rows like:
-  // { price_label_1: "Open", price_1: -285, price_label_2: "High", price_2: -315 }
   const range = { open: null, high: null, low: null, last: null };
   if (!Array.isArray(records)) return range;
 
@@ -184,10 +134,25 @@ function reduceRange(records) {
   };
 
   for (const r of records) {
+    if (!r || typeof r !== 'object') continue;
     setIfLabel(r.price_label_1, r.price_1);
     setIfLabel(r.price_label_2, r.price_2);
   }
   return range;
+}
+
+// Find arrays with price_label_1/price_1 and return both path & arr
+function findRangeArraysWithPaths(root) {
+  const out = [];
+  walk(root, (node, pathArr) => {
+    if (!Array.isArray(node)) return;
+    const first = node.find(v => v && typeof v === 'object');
+    if (!first) return;
+    const keys = Object.keys(first);
+    const hasPrice = keys.some(k => /^price_?label_?1$/i.test(k) || /^price_?1$/i.test(k));
+    if (hasPrice) out.push({ path: pathArr.join('.'), arr: node });
+  });
+  return out;
 }
 
 function main() {
@@ -199,21 +164,40 @@ function main() {
 
   const root = readJSON(inputPath);
 
-  // 1) HISTORY
-  const histArr = findMoneyLineHistory(root);
+  // 1) HISTORY — try exact path first (from your debug), then fallback search
+  let histArr =
+    get(root, ['raw', 'moneylinemovement', 'data', 'sections', 'Money Line History']) ||
+    null;
+
+  if (!histArr) {
+    // Fallback: recursive search for any array under a key containing "Money Line" and "History"
+    walk(root, (node, pathArr) => {
+      if (!histArr && Array.isArray(node)) {
+        const lastKey = String(pathArr[pathArr.length - 1] ?? '');
+        if (/money\s*line/i.test(lastKey) && /history/i.test(lastKey)) histArr = node;
+      }
+    });
+  }
+
   const history = extractMoneyLineHistory(histArr, HOME_ABBR, AWAY_ABBR, SEASON_YEAR);
 
-  // 2) CURRENT from a "Current" row if present, otherwise first row
+  // 2) CURRENT — prefer a "Current" labeled row if present
   let current = { home: null, away: null };
   if (history.length) {
     const currentRow = history.find(h => (h.label || '').toLowerCase() === 'current') || history[0];
     current = { home: currentRow.home ?? null, away: currentRow.away ?? null };
   }
 
-  // 3) RANGES (pick first two qualifying arrays as home/away ranges)
-  const rangeArrays = findRangeArrays(root);
-  const range_home = reduceRange(rangeArrays[0] || []);
-  const range_away = reduceRange(rangeArrays[1] || []);
+  // 3) RANGES — use only moneylinemovement arrays
+  const ranges = findRangeArraysWithPaths(root)
+    .filter(x => /(^|\.)(moneylinemovement)(\.|$)/i.test(x.path)); // keep only moneyline movement
+
+  // Try to pick "Matchup Menu" as home and "Line Movement" as away
+  const homeRangeArr = ranges.find(x => /matchup menu/i.test(x.path))?.arr || ranges[0]?.arr || [];
+  const awayRangeArr = ranges.find(x => /line movement/i.test(x.path))?.arr || ranges[1]?.arr || [];
+
+  const range_home = reduceRange(homeRangeArr);
+  const range_away = reduceRange(awayRangeArr);
 
   const compiled = {
     meta: {
