@@ -1,18 +1,12 @@
 #!/usr/bin/env node
 /**
- * Very first pass converter: messy compiled JSON -> clean v1 schema skeleton.
+ * Robust pass: messy compiled JSON -> clean v1 schema skeleton (+ Money Line Movement).
+ * - Recursively searches for money line history anywhere in the JSON.
+ * - Recursively searches for range arrays (price_label_1/price_1 pairs).
+ * - Parses team moneyline columns dynamically (e.g., PIT/BUF, away/home).
+ *
  * Usage:
- *   node scripts/convert-compiled-nfl.js <input.json> <output.json> <HOME_ABBR> <AWAY_ABBR> [SEASON_YEAR]
- * Example:
- *   node scripts/convert-compiled-nfl.js data/compiled-28.json out/compiled_nfl_v1.json BUF PIT 2021
- *
- * What this does now:
- * - Creates the v1 top-level structure with empty sections (placeholders).
- * - Converts Money Line History into moneylinemovement.history (numbers).
- * - Sets moneylinemovement.current if a "Current" row exists (or uses last row).
- * - Tries to fill range_home and range_away from “Matchup Menu” and “Line Movement” sections if present.
- *
- * We will add the other sections (injuries, matchupstats, etc.) in the next steps.
+ *   node docs/scripts/convert-compiled-nfl.js <input.json> <output.json> <HOME_ABBR> <AWAY_ABBR> [SEASON_YEAR]
  */
 
 const fs = require('fs');
@@ -28,20 +22,13 @@ function writeJSON(p, obj) {
   fs.writeFileSync(p, JSON.stringify(obj, null, 2), 'utf8');
 }
 
-function get(obj, pathArr, def = undefined) {
-  try {
-    return pathArr.reduce((o, k) => (o && o[k] !== undefined ? o[k] : undefined), obj) ?? def;
-  } catch {
-    return def;
-  }
-}
-
 function parseMoney(val) {
   if (val == null) return null;
   if (typeof val === 'number') return val;
   if (typeof val === 'string') {
-    // "+233" or "-267"
-    const n = parseInt(val.replace(/\s/g, ''), 10);
+    const trimmed = val.trim();
+    // "+233", "-267", maybe quoted numbers
+    const n = parseInt(trimmed.replace(/\s/g, ''), 10);
     return Number.isNaN(n) ? null : n;
   }
   return null;
@@ -52,22 +39,16 @@ function monthToNum(m) {
   return map[m] || null;
 }
 
-// Try to parse strings like "Sep 12 1:02 PM" using a season year.
-// Returns ISO string or null if it can’t parse.
+// Try to parse strings like "Sep 12 1:02 PM" or "09/12 01:05 PM" using a season year.
 function parseToISO(label, seasonYear) {
   if (!label || typeof label !== 'string') return null;
-  // Already ISO?
   if (/^\d{4}-\d{2}-\d{2}T/.test(label)) return label;
 
-  // Examples seen: "Sep 12 1:02 PM", "09/12 01:05 PM"
   try {
     let year = parseInt(seasonYear, 10);
-    if (!year || Number.isNaN(year)) {
-      // fallback: use current year
-      year = new Date().getUTCFullYear();
-    }
+    if (!year || Number.isNaN(year)) year = new Date().getUTCFullYear();
 
-    // Format A: "Sep 12 1:02 PM"
+    // "Sep 12 1:02 PM"
     const a = label.match(/^([A-Za-z]{3})\s+(\d{1,2})\s+(\d{1,2}):(\d{2})\s*(AM|PM)$/);
     if (a) {
       const mon = monthToNum(a[1]);
@@ -76,11 +57,10 @@ function parseToISO(label, seasonYear) {
       const ampm = a[5];
       if (ampm === 'PM' && hh !== 12) hh += 12;
       if (ampm === 'AM' && hh === 12) hh = 0;
-      const iso = new Date(Date.UTC(year, mon - 1, parseInt(a[2], 10), hh, mm, 0)).toISOString();
-      return iso;
+      return new Date(Date.UTC(year, mon - 1, parseInt(a[2], 10), hh, mm, 0)).toISOString();
     }
 
-    // Format B: "09/12 01:05 PM"
+    // "09/12 01:05 PM"
     const b = label.match(/^(\d{2})\/(\d{2})\s+(\d{2}):(\d{2})\s*(AM|PM)$/);
     if (b) {
       const mon = parseInt(b[1], 10);
@@ -90,136 +70,150 @@ function parseToISO(label, seasonYear) {
       const ampm = b[5];
       if (ampm === 'PM' && hh !== 12) hh += 12;
       if (ampm === 'AM' && hh === 12) hh = 0;
-      const iso = new Date(Date.UTC(year, mon - 1, day, hh, mm, 0)).toISOString();
-      return iso;
+      return new Date(Date.UTC(year, mon - 1, day, hh, mm, 0)).toISOString();
     }
 
-    // Accept tokens like "Current", "Open" → no ISO
     return null;
   } catch {
     return null;
   }
 }
 
-// Detect team keys from a record (anything that isn't "time stamp"/"timestamp"/"label")
-function detectTeamKeys(rec) {
-  const ignore = new Set(['time stamp', 'timestamp', 'label']);
-  return Object.keys(rec || {}).filter(k => !ignore.has(k));
+// Helpers to search the entire object graph
+function walk(obj, fn, path = []) {
+  if (!obj || typeof obj !== 'object') return;
+  fn(obj, path);
+  if (Array.isArray(obj)) {
+    obj.forEach((v, i) => walk(v, fn, path.concat([i])));
+  } else {
+    Object.keys(obj).forEach(k => walk(obj[k], fn, path.concat([k])));
+  }
 }
 
-function extractMoneyLineHistory(raw, homeKey, awayKey, seasonYear) {
-  const out = [];
-  if (!Array.isArray(raw)) return out;
+function keyIncludesAny(key, regexes) {
+  const s = String(key).toLowerCase();
+  return regexes.some(rx => rx.test(s));
+}
 
-  // Try to infer team keys from the first row that has at least 2 team columns.
-  let inferred = null;
-  for (const rec of raw) {
-    const keys = detectTeamKeys(rec);
-    if (keys.length >= 2) {
-      inferred = keys;
-      break;
+function findMoneyLineHistory(root) {
+  // Find an array whose parent key looks like "money line history"
+  // Example key variants: "Money Line History", "moneylinehistory", "money line history"
+  const matches = [];
+  walk(root, (node, path) => {
+    if (!Array.isArray(node)) return;
+    const lastKey = String(path[path.length - 1] ?? '').toLowerCase();
+    if (/(^|[^a-z])money\s*line([^a-z]|$)/i.test(lastKey) && /history/i.test(lastKey)) {
+      matches.push({ path, arr: node });
     }
+  });
+  // If none found, try to find any array of objects that has both team columns and a "time stamp"/"timestamp"/"label"
+  if (matches.length === 0) {
+    walk(root, (node, path) => {
+      if (!Array.isArray(node)) return;
+      const first = node.find(v => v && typeof v === 'object');
+      if (!first) return;
+      const keys = Object.keys(first);
+      const hasLabel = keys.some(k => /^(time stamp|timestamp|label)$/i.test(k));
+      // at least two non-label columns (teams)
+      const teamCols = keys.filter(k => !/^(time stamp|timestamp|label)$/i.test(k));
+      if (hasLabel && teamCols.length >= 2) {
+        matches.push({ path, arr: node });
+      }
+    });
   }
+  return matches[0]?.arr || null;
+}
 
-  for (const rec of raw) {
+function findRangeArrays(root) {
+  // Arrays containing objects with price_label_1/price_1 pairs
+  const rangeArrays = [];
+  walk(root, (node, path) => {
+    if (!Array.isArray(node)) return;
+    const first = node.find(v => v && typeof v === 'object');
+    if (!first) return;
+    const keys = Object.keys(first);
+    const hasPrice = keys.some(k => /^price_?label_?1$/i.test(k) || /^price_?1$/i.test(k));
+    if (hasPrice) rangeArrays.push({ path, arr: node });
+  });
+  return rangeArrays.map(x => x.arr);
+}
+
+function detectTeamKeys(rec, preferredHome, preferredAway) {
+  const ignore = new Set(['time stamp', 'timestamp', 'label']);
+  const keys = Object.keys(rec || {}).filter(k => !ignore.has(k));
+  // Use provided abbreviations if present
+  if (preferredHome && keys.includes(preferredHome)) {
+    if (preferredAway && keys.includes(preferredAway)) return { homeKey: preferredHome, awayKey: preferredAway };
+  }
+  // Otherwise, just pick first two keys; later we will assign inferred[1] => home, inferred[0] => away
+  if (keys.length >= 2) return { homeKey: keys[1], awayKey: keys[0] };
+  return { homeKey: null, awayKey: null };
+}
+
+function extractMoneyLineHistory(arr, preferredHome, preferredAway, seasonYear) {
+  const out = [];
+  if (!Array.isArray(arr)) return out;
+  let keysChosen = null;
+
+  for (const rec of arr) {
+    if (!keysChosen) keysChosen = detectTeamKeys(rec, preferredHome, preferredAway);
     const label = rec['time stamp'] ?? rec['timestamp'] ?? rec['label'] ?? '';
     const timestamp = parseToISO(label, seasonYear);
-
-    let hk = homeKey;
-    let ak = awayKey;
-
-    // If provided keys aren't present, fall back to inferred ones.
-    if (!rec[hk] || !rec[ak]) {
-      if (inferred && inferred.length >= 2) {
-        // If the provided keys don't match, assume inferred[1] is home (usually favorite) if negative,
-        // but we don't know. We'll just map inferred[0] => away, inferred[1] => home for consistency.
-        ak = inferred[0];
-        hk = inferred[1];
-      }
-    }
-
-    const home = parseMoney(rec[hk]);
-    const away = parseMoney(rec[ak]);
-
-    // Skip lines with no money values (like header markers)
+    const home = parseMoney(rec[keysChosen.homeKey]);
+    const away = parseMoney(rec[keysChosen.awayKey]);
     if (home == null && away == null) continue;
-
-    out.push({
-      timestamp: timestamp || null,
-      label: label || null,
-      home,
-      away
-    });
+    out.push({ timestamp: timestamp || null, label: label || null, home, away });
   }
   return out;
 }
 
-function reduceRange(records, side /* 'home' | 'away' */) {
-  // Find labels like Open/High/Low/Last across rows
-  // Records look like: { team_line: "BUF -267", price_label_1: "Open", price_1: -285, price_label_2: "High", price_2: -315 }
+function reduceRange(records) {
+  // Combine open/high/low/last from rows like:
+  // { price_label_1: "Open", price_1: -285, price_label_2: "High", price_2: -315 }
   const range = { open: null, high: null, low: null, last: null };
   if (!Array.isArray(records)) return range;
 
   const setIfLabel = (label, value) => {
-    if (typeof value !== 'number') return;
-    const L = (label || '').toLowerCase();
-    if (L.includes('open') && range.open == null) range.open = value;
-    if (L.includes('high') && range.high == null) range.high = value;
-    if (L.includes('low') && range.low == null) range.low = value;
-    if (L.includes('last') && range.last == null) range.last = value;
+    const L = String(label || '').toLowerCase();
+    const val = typeof value === 'string' ? parseMoney(value) : value;
+    if (typeof val !== 'number') return;
+    if (L.includes('open') && range.open == null) range.open = val;
+    if (L.includes('high') && range.high == null) range.high = val;
+    if (L.includes('low') && range.low == null) range.low = val;
+    if (L.includes('last') && range.last == null) range.last = val;
   };
 
   for (const r of records) {
     setIfLabel(r.price_label_1, r.price_1);
     setIfLabel(r.price_label_2, r.price_2);
   }
-
   return range;
-}
-
-function extractMoneylineRanges(moneylineMovementSection, homeKey, awayKey) {
-  // moneylineMovementSection is expected to be an object with keys like:
-  // "Matchup Menu: PIT @ BUF": [ ...home rows... ]
-  // "Line Movement": [ ...away rows... ]
-  const keys = Object.keys(moneylineMovementSection || {});
-  const matchupKey = keys.find(k => /matchup menu/i.test(k)) || null;
-  const awayKeyBlock = keys.find(k => /^line movement$/i.test(k)) || null;
-
-  const homeRows = matchupKey ? moneylineMovementSection[matchupKey] : null;
-  const awayRows = awayKeyBlock ? moneylineMovementSection[awayKeyBlock] : null;
-
-  const range_home = reduceRange(homeRows, 'home');
-  const range_away = reduceRange(awayRows, 'away');
-  return { range_home, range_away };
 }
 
 function main() {
   const [, , inputPath, outputPath, HOME_ABBR, AWAY_ABBR, SEASON_YEAR] = process.argv;
-
   if (!inputPath || !outputPath) {
-    console.error('Usage: node scripts/convert-compiled-nfl.js <input.json> <output.json> <HOME_ABBR> <AWAY_ABBR> [SEASON_YEAR]');
+    console.error('Usage: node docs/scripts/convert-compiled-nfl.js <input.json> <output.json> <HOME_ABBR> <AWAY_ABBR> [SEASON_YEAR]');
     process.exit(1);
   }
 
-  const input = readJSON(inputPath);
+  const root = readJSON(inputPath);
 
-  // Try to find the "Money Line History" array (case insensitive search through moneylinemovement)
-  const moneylineMovementSection = get(input, ['moneylinemovement']) || get(input, ['Money Line Movement']) || {};
-  const mlHistory =
-    get(moneylineMovementSection, ['Money Line History']) ||
-    get(moneylineMovementSection, ['money line history']) ||
-    get(moneylineMovementSection, ['history']) || [];
+  // 1) HISTORY
+  const histArr = findMoneyLineHistory(root);
+  const history = extractMoneyLineHistory(histArr, HOME_ABBR, AWAY_ABBR, SEASON_YEAR);
 
-  const history = extractMoneyLineHistory(mlHistory, HOME_ABBR, AWAY_ABBR, SEASON_YEAR);
-
-  // Determine current from a "Current" row, else last row
+  // 2) CURRENT from a "Current" row if present, otherwise first row
   let current = { home: null, away: null };
-  const currentRow = history.find(h => (h.label || '').toLowerCase() === 'current');
-  const effective = currentRow || history[0] || null;
-  if (effective) current = { home: effective.home, away: effective.away };
+  if (history.length) {
+    const currentRow = history.find(h => (h.label || '').toLowerCase() === 'current') || history[0];
+    current = { home: currentRow.home ?? null, away: currentRow.away ?? null };
+  }
 
-  // Ranges
-  const { range_home, range_away } = extractMoneylineRanges(moneylineMovementSection, HOME_ABBR, AWAY_ABBR);
+  // 3) RANGES (pick first two qualifying arrays as home/away ranges)
+  const rangeArrays = findRangeArrays(root);
+  const range_home = reduceRange(rangeArrays[0] || []);
+  const range_away = reduceRange(rangeArrays[1] || []);
 
   const compiled = {
     meta: {
@@ -230,7 +224,6 @@ function main() {
       generated_at: new Date().toISOString()
     },
 
-    // Placeholders for now; we will fill these in later steps.
     dualgamelog: {},
     efficiencystats: {},
     headtohead: {},
