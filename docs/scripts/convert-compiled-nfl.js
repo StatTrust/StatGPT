@@ -192,8 +192,6 @@ function parseTimestampLabel(label, seasonYear) {
     return result;
   }
 
-  // e.g. "05/16 09:04 AM" – covered by pattern above
-
   // If nothing matched, keep label only.
   return result;
 }
@@ -928,23 +926,11 @@ function extractTravelAnalysis(root, HOME_ABBR, AWAY_ABBR) {
   };
 }
 
-// --------------------------- main ---------------------------
-
-function main() {
-  const [, , inputPath, outputPath, homeAbbr, awayAbbr, seasonYearStr] = process.argv;
-
-  if (!inputPath || !outputPath || !homeAbbr || !awayAbbr) {
-    console.error('Usage: node convert-compiled-nfl.js <input.json> <output.json> <HOME_ABBR> <AWAY_ABBR> [SEASON_YEAR]');
-    process.exit(1);
-  }
-
-  const SEASON_YEAR = seasonYearStr ? Number(seasonYearStr) : null;
-
-  const input = readJSON(inputPath);
-
-  const HOME_ABBR = homeAbbr.toUpperCase();
-  const AWAY_ABBR = awayAbbr.toUpperCase();
-
+/**
+ * Vercel-safe pure converter:
+ * Accepts a messy compiled object + team context, returns v1 normalized object.
+ */
+function convertCompiledNFLObject(input, HOME_ABBR, AWAY_ABBR, SEASON_YEAR = null) {
   const meta = extractMeta(input, HOME_ABBR, AWAY_ABBR, SEASON_YEAR);
   const moneylinemovement = extractMoneyLineMovement(input, HOME_ABBR, AWAY_ABBR, SEASON_YEAR);
   const pointspreadlinemovement = extractSpreadMovement(input, HOME_ABBR, AWAY_ABBR, SEASON_YEAR);
@@ -966,7 +952,7 @@ function main() {
   const similargamesanalysis = extractSimilarGames(input);
   const travelanalysis = extractTravelAnalysis(input, HOME_ABBR, AWAY_ABBR);
 
-  const compiled = {
+  return {
     meta,
     dualgamelog,
     efficiencystats,
@@ -986,19 +972,48 @@ function main() {
     statsplits,
     travelanalysis
   };
+}
+
+// --------------------------- main ---------------------------
+
+function main() {
+  const [, , inputPath, outputPath, homeAbbr, awayAbbr, seasonYearStr] = process.argv;
+
+  if (!inputPath || !outputPath || !homeAbbr || !awayAbbr) {
+    console.error('Usage: node convert-compiled-nfl.js <input.json> <output.json> <HOME_ABBR> <AWAY_ABBR> [SEASON_YEAR]');
+    process.exit(1);
+  }
+
+  const SEASON_YEAR = seasonYearStr ? Number(seasonYearStr) : null;
+
+  const input = readJSON(inputPath);
+
+  const HOME_ABBR = homeAbbr.toUpperCase();
+  const AWAY_ABBR = awayAbbr.toUpperCase();
+
+  const compiled = convertCompiledNFLObject(input, HOME_ABBR, AWAY_ABBR, SEASON_YEAR);
 
   writeJSON(outputPath, compiled);
 
   console.log(`Wrote ${outputPath}`);
   console.log('Summary:');
-  console.log(`  Moneyline history rows: ${moneylinemovement.history.length}`);
-  console.log(`  Spread history rows: ${pointspreadlinemovement.spread_history.length}`);
-  console.log(`  Totals history rows: ${overunderlinemovement.totals_history.length}`);
-  console.log(`  Home injuries: ${injuryreport.home_injuries.length}`);
-  console.log(`  Away injuries: ${injuryreport.away_injuries.length}`);
-  console.log(`  Stat splits (scoring): ${statsplits.scoring_and_yardage_last_season.length}`);
+  console.log(`  Moneyline history rows: ${compiled.moneylinemovement.history.length}`);
+  console.log(`  Spread history rows: ${compiled.pointspreadlinemovement.spread_history.length}`);
+  console.log(`  Totals history rows: ${compiled.overunderlinemovement.totals_history.length}`);
+  console.log(`  Home injuries: ${compiled.injuryreport.home_injuries.length}`);
+  console.log(`  Away injuries: ${compiled.injuryreport.away_injuries.length}`);
+  console.log(`  Stat splits (scoring): ${compiled.statsplits.scoring_and_yardage_last_season.length}`);
 }
 
 if (require.main === module) {
   main();
 }
+
+/**
+ * Export for serverless usage (Vercel/router.js).
+ * This allows:
+ *   const { convertCompiledNFLObject } = require('../docs/scripts/convert-compiled-nfl');
+ */
+module.exports = {
+  convertCompiledNFLObject
+};
