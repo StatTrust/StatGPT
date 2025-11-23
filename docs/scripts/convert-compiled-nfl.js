@@ -974,6 +974,12 @@ function convertCompiledNFLObject(input, HOME_ABBR, AWAY_ABBR, SEASON_YEAR = nul
   };
 }
 
+// Alias with the exact name the router tries to import.
+// (Keeps backwards-compat with your existing CLI + CJS usage.)
+function convertCompiledNflObject(input, HOME_ABBR, AWAY_ABBR, SEASON_YEAR = null) {
+  return convertCompiledNFLObject(input, HOME_ABBR, AWAY_ABBR, SEASON_YEAR);
+}
+
 // --------------------------- main ---------------------------
 
 function main() {
@@ -1010,10 +1016,15 @@ if (require.main === module) {
 }
 
 /**
- * Export for serverless usage (Vercel/router.js).
+ * Export for serverless usage (Vercel/router.js) AND legacy CJS usage.
+ *
  * This allows:
  *   const { convertCompiledNFLObject } = require('../docs/scripts/convert-compiled-nfl');
+ *   const { convertCompiledNflObject } = require('../docs/scripts/convert-compiled-nfl');
+ *
+ * Router import() of this CJS module will see these on mod.default.*
  */
 module.exports = {
-  convertCompiledNFLObject
+  convertCompiledNFLObject,
+  convertCompiledNflObject
 };
