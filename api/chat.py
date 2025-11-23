@@ -165,8 +165,24 @@ class handler(BaseHTTPRequestHandler):
             raw = self.rfile.read(length) if length > 0 else b"{}"
             data = json.loads(raw.decode() or "{}")
 
-            msg = (data.get("message") or "").strip()
-            system = data.get("system") or "You are StatGPT, a helpful assistant for sports data insights."
+            # ✅ Backward-compatible message extraction
+            msg = (
+                data.get("message")
+                or data.get("userMessage")
+                or data.get("user_message")
+                or data.get("text")
+                or ""
+            ).strip()
+
+            # ✅ Backward-compatible system/prompt extraction
+            system = (
+                data.get("system")
+                or data.get("prompt")
+                or data.get("promptText")
+                or data.get("prompt_text")
+                or "You are StatGPT, a helpful assistant for sports data insights."
+            )
+
             model = data.get("model") or MODEL
 
             if not msg:
