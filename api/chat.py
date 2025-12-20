@@ -1,243 +1,342 @@
+# api/chat.py
+import os
+import json
 from http.server import BaseHTTPRequestHandler
-import json, os, re
+from urllib.parse import urlparse
+
 from openai import OpenAI
-import httpx
 
-# Allowed origins (CORS)
-ALLOWED = [s.strip() for s in os.getenv("ALLOWED_ORIGINS", "*").split(",")]
-ALLOW_ALL = "*" in ALLOWED
+# ---------------------------
+# Config
+# ---------------------------
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
 
-# Default model
-MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+# Default text model (kept as-is)
+DEFAULT_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5-mini").strip()
 
-# Upstash (for pointer retrieval)
-UPSTASH_URL = os.getenv("UPSTASH_REDIS_REST_URL", "").rstrip("/")
-UPSTASH_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
+# Optional: separate model for vision (falls back to DEFAULT_MODEL if unset)
+DEFAULT_VISION_MODEL = os.environ.get("OPENAI_VISION_MODEL", "").strip() or DEFAULT_MODEL
 
-# Inline summarization limits
-MAX_SECTIONS_INLINE = int(os.getenv("MAX_SECTIONS_INLINE", "12"))  # limit section summaries
-MAX_SECTION_CHARS = int(os.getenv("MAX_SECTION_CHARS", "1800"))    # cap each summarized section
+# Optional: if you store attachments in a public bucket/CDN, set this (ex: https://cdn.stat-trust.com/)
+ATTACHMENTS_PUBLIC_BASE_URL = os.environ.get("ATTACHMENTS_PUBLIC_BASE_URL", "").strip().rstrip("/")
 
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+DEFAULT_SYSTEM = (
+    os.environ.get(
+        "STATGPT_SYSTEM",
+        "You are StatGPT. Be concise, factual, and sports-savvy.",
+    )
+    .strip()
+)
 
-def _cors_headers(origin: str):
-    h = {
-        "content-type": "application/json",
-        "access-control-allow-methods": "POST, OPTIONS",
-        "access-control-allow-headers": "content-type",
-        "access-control-max-age": "86400",
-    }
-    if ALLOW_ALL or not origin or origin in ALLOWED:
-        h["access-control-allow-origin"] = origin or "*"
-    return h
+DEFAULT_MAX_TOKENS = int(os.environ.get("STATGPT_MAX_TOKENS", "1500"))
+DEFAULT_TEMPERATURE = float(os.environ.get("STATGPT_TEMPERATURE", "0.3"))
 
-def fetch_pointer_blob(pointer_key: str) -> str:
-    """
-    Fetch the 'blob' field from an Upstash Redis hash: HGET <pointer_key> blob.
-    Expected Node side stored: kv.hset(pointerKey, { blob: <compiledJson>, bytes: <int>, ts: <timestamp> })
-    """
-    if not UPSTASH_URL or not UPSTASH_TOKEN:
-        raise RuntimeError("Upstash REST not configured (UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN)")
-    url = f"{UPSTASH_URL}/hget/{pointer_key}/blob"
-    headers = {"Authorization": f"Bearer {UPSTASH_TOKEN}"}
-    with httpx.Client(timeout=30.0) as http:
-        r = http.get(url, headers=headers)
-    if r.status_code != 200:
-        raise RuntimeError(f"Upstash HGET failed ({r.status_code}): {r.text}")
-    data = r.json()
-    blob = data.get("result")
-    if blob is None:
-        raise RuntimeError(f"Pointer not found or blob missing for key: {pointer_key}")
-    return blob
+# If you want to allow your router/server to call this with a shared secret:
+# - Set STATGPT_SHARED_SECRET in Vercel env
+# - Send header: x-stattrust-secret: <value>
+SHARED_SECRET = os.environ.get("STATGPT_SHARED_SECRET", "").strip()
 
-def extract_fallback_from_system(system_text: str) -> str | None:
-    """
-    Backward compatibility: Extract raw JSON inside <COMPILED_JSON>...</COMPILED_JSON>.
-    Remove this once all callers send compiledInline/compiledPointer.
-    """
-    if not system_text:
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+
+def _safe_json_loads(s: str):
+    try:
+        return json.loads(s)
+    except Exception:
         return None
-    m = re.search(r"<COMPILED_JSON>([\s\S]*?)</COMPILED_JSON>", system_text)
-    if not m:
+
+
+def _coerce_to_input_parts(content):
+    """
+    Convert various message content formats into Responses API content parts.
+    Supports:
+      - string -> [{"type":"input_text","text":...}]
+      - chat.completions style list parts -> convert ("text"/"image_url") to ("input_text"/"input_image")
+      - already Responses-style parts -> pass through
+    """
+    if content is None:
+        return []
+
+    # Plain string
+    if isinstance(content, str):
+        return [{"type": "input_text", "text": content}]
+
+    # Already list of parts
+    if isinstance(content, list):
+        parts = []
+        for p in content:
+            if isinstance(p, str):
+                parts.append({"type": "input_text", "text": p})
+                continue
+
+            if not isinstance(p, dict):
+                continue
+
+            ptype = p.get("type")
+
+            # Already Responses-style
+            if ptype in ("input_text", "input_image", "input_file"):
+                parts.append(p)
+                continue
+
+            # Chat Completions style
+            if ptype == "text":
+                parts.append({"type": "input_text", "text": p.get("text", "")})
+                continue
+
+            if ptype == "image_url":
+                img = p.get("image_url") or {}
+                if isinstance(img, dict):
+                    url = img.get("url") or ""
+                else:
+                    url = str(img)
+                if url:
+                    parts.append({"type": "input_image", "image_url": url})
+                continue
+
+            # Unknown: best effort treat as text-ish
+            if "text" in p and isinstance(p["text"], str):
+                parts.append({"type": "input_text", "text": p["text"]})
+                continue
+
+        return parts
+
+    # Dict (rare) -> best effort
+    if isinstance(content, dict):
+        if "text" in content and isinstance(content["text"], str):
+            return [{"type": "input_text", "text": content["text"]}]
+        # If it's already a part-like dict
+        if content.get("type") in ("input_text", "input_image", "input_file"):
+            return [content]
+
+    return [{"type": "input_text", "text": str(content)}]
+
+
+def _normalize_attachment(att: dict):
+    """
+    Normalize an attachment object into a Responses API input_image part when possible.
+    Supports:
+      - { url / image_url }
+      - { dataUrl / data_url } (base64 data URL)
+      - { base64 } (+mime) (raw base64 => convert to data URL)
+      - { bytes_base64 } (+mime) (raw base64 => convert to data URL)
+      - { key } (+ATTACHMENTS_PUBLIC_BASE_URL)
+      - { file_id } => input_file
+    """
+    if not isinstance(att, dict):
         return None
-    return m.group(1).strip()
 
-def load_compiled(data: dict) -> tuple[dict, str]:
+    # File ID (Files API)
+    file_id = att.get("file_id") or att.get("fileId")
+    if isinstance(file_id, str) and file_id.strip():
+        return {"type": "input_file", "file_id": file_id.strip()}
+
+    # Direct URL
+    url = att.get("image_url") or att.get("url")
+    if isinstance(url, str) and url.strip():
+        return {"type": "input_image", "image_url": url.strip()}
+
+    # Data URL
+    data_url = att.get("dataUrl") or att.get("data_url") or att.get("dataURL")
+    if isinstance(data_url, str) and data_url.strip().startswith("data:"):
+        return {"type": "input_image", "image_url": data_url.strip()}
+
+    # Raw base64 (convert)
+    b64 = att.get("bytes_base64") or att.get("base64") or att.get("b64")
+    mime = (att.get("mime") or att.get("contentType") or "image/png").strip()
+    if isinstance(b64, str) and b64.strip():
+        # if it's already data URL-ish, keep
+        if b64.strip().startswith("data:"):
+            return {"type": "input_image", "image_url": b64.strip()}
+        return {"type": "input_image", "image_url": f"data:{mime};base64,{b64.strip()}"}
+
+    # Key -> public base url
+    key = att.get("key")
+    if isinstance(key, str) and key.strip() and ATTACHMENTS_PUBLIC_BASE_URL:
+        # key may already include "attachments/..."
+        return {"type": "input_image", "image_url": f"{ATTACHMENTS_PUBLIC_BASE_URL}/{key.strip().lstrip('/')}"}
+
+    return None
+
+
+def _extract_attachments(data: dict):
     """
-    Returns (compiled_dict, source_mode) where source_mode is:
-    'inline', 'pointer', 'system-fallback'.
-    Raises ValueError if JSON invalid or nothing found.
+    Accept both:
+      - attachments: [ { ... } ]
+      - attachment: { ... }  (or JSON string)
+    Returns a list of normalized parts (input_image/input_file).
     """
-    # Priority 1: compiledInline
-    inline = data.get("compiledInline")
-    if inline:
-        try:
-            return json.loads(inline), "inline"
-        except Exception as e:
-            raise ValueError(f"compiledInline invalid JSON: {e}")
+    parts = []
 
-    # Priority 2: compiledPointer
-    pointer = data.get("compiledPointer")
-    if pointer:
-        try:
-            blob = fetch_pointer_blob(pointer)
-        except Exception as e:
-            raise ValueError(f"Failed to fetch pointer '{pointer}': {e}")
-        try:
-            return json.loads(blob), "pointer"
-        except Exception as e:
-            raise ValueError(f"Pointer blob invalid JSON: {e}")
+    atts = data.get("attachments")
+    if isinstance(atts, list):
+        for a in atts:
+            p = _normalize_attachment(a)
+            if p:
+                parts.append(p)
 
-    # Priority 3: system fallback
-    system_text = data.get("system") or ""
-    extracted = extract_fallback_from_system(system_text)
-    if extracted:
-        try:
-            return json.loads(extracted), "system-fallback"
-        except Exception as e:
-            raise ValueError(f"Fallback system JSON invalid: {e}")
+    att = data.get("attachment")
+    if isinstance(att, str):
+        maybe = _safe_json_loads(att)
+        if isinstance(maybe, dict):
+            att = maybe
+    if isinstance(att, dict):
+        p = _normalize_attachment(att)
+        if p:
+            parts.append(p)
 
-    raise ValueError("No compiledInline, compiledPointer, or <COMPILED_JSON> fallback provided.")
+    return parts
 
-def summarize_compiled(compiled: dict) -> str:
-    """
-    Build a concise textual summary to give model enough structure
-    without dumping entire massive JSON again.
-    - Include meta
-    - Include a teaser of sections (titles + truncated content length)
-    """
-    meta = compiled.get("meta", {})
-    prompt = compiled.get("prompt", "")
-    sections = compiled.get("sections", {})
-    lines = []
-    if meta:
-        matchup_title = meta.get("matchupTitle") or meta.get("matchupId") or "Unknown Matchup"
-        league = meta.get("league") or ""
-        compiled_at = meta.get("compiledAt") or ""
-        lines.append(f"Matchup: {matchup_title}")
-        if league:
-            lines.append(f"League: {league}")
-        if compiled_at:
-            lines.append(f"CompiledAt: {compiled_at}")
-    if prompt:
-        # Show only first 300 chars of prompt to avoid huge injection
-        lines.append(f"TemplatePrompt(first300): {prompt[:300].replace('\\n',' ')}{'...' if len(prompt)>300 else ''}")
 
-    # Sections summary
-    if isinstance(sections, dict) and sections:
-        lines.append(f"SectionsCount: {len(sections)}")
-        count = 0
-        for sec_title, per_cat in sections.items():
-            if count >= MAX_SECTIONS_INLINE:
-                lines.append(f"...({len(sections)-count} more sections truncated in summary)")
-                break
-            # Summarize categories present
-            cat_names = list(per_cat.keys())
-            sec_line = f"Section: {sec_title} (categories: {', '.join(cat_names)})"
-            # Optionally include truncated JSON snippet
-            try:
-                snippet = json.dumps(per_cat)[:MAX_SECTION_CHARS]
-                if len(json.dumps(per_cat)) > MAX_SECTION_CHARS:
-                    snippet += "...(truncated snippet)"
-                sec_line += f" snippet={snippet}"
-            except Exception:
-                pass
-            lines.append(sec_line)
-            count += 1
-    else:
-        lines.append("Sections: none or not a dict")
+class Handler(BaseHTTPRequestHandler):
+    def _set_headers(self, status=200, content_type="application/json"):
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
 
-    return "\n".join(lines)
-
-class handler(BaseHTTPRequestHandler):
-    def do_OPTIONS(self):
-        origin = self.headers.get("origin", "")
-        self.send_response(204)
-        for k, v in _cors_headers(origin).items():
-            self.send_header(k, v)
+        # CORS (kept permissive)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header(
+            "Access-Control-Allow-Headers",
+            "Content-Type, Authorization, x-stattrust-secret",
+        )
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.end_headers()
+
+    def do_OPTIONS(self):
+        self._set_headers(200, "text/plain")
+        self.wfile.write(b"ok")
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        if parsed.path.endswith("/healthz") or parsed.path.endswith("/health"):
+            self._set_headers(200, "application/json")
+            self.wfile.write(json.dumps({"ok": True}).encode("utf-8"))
+            return
+        self._set_headers(404, "application/json")
+        self.wfile.write(json.dumps({"error": "Not found"}).encode("utf-8"))
 
     def do_POST(self):
-        origin = self.headers.get("origin", "")
+        # Optional shared-secret protection (does nothing unless you set STATGPT_SHARED_SECRET)
+        if SHARED_SECRET:
+            got = (self.headers.get("x-stattrust-secret") or "").strip()
+            if got != SHARED_SECRET:
+                self._set_headers(401, "application/json")
+                self.wfile.write(json.dumps({"error": "Unauthorized"}).encode("utf-8"))
+                return
+
+        length = int(self.headers.get("Content-Length", "0"))
+        raw_body = self.rfile.read(length).decode("utf-8", errors="ignore")
 
         try:
-            length = int(self.headers.get("content-length", "0"))
-            raw = self.rfile.read(length) if length > 0 else b"{}"
-            data = json.loads(raw.decode() or "{}")
+            data = json.loads(raw_body) if raw_body else {}
+        except Exception:
+            self._set_headers(400, "application/json")
+            self.wfile.write(json.dumps({"error": "Invalid JSON"}).encode("utf-8"))
+            return
 
-            # ✅ Backward-compatible message extraction
-            msg = (
-                data.get("message")
-                or data.get("userMessage")
-                or data.get("user_message")
-                or data.get("text")
-                or ""
-            ).strip()
+        try:
+            model = (data.get("model") or DEFAULT_MODEL).strip()
+            messages = data.get("messages") or []
+            system = (data.get("system") or DEFAULT_SYSTEM).strip()
+            temperature = float(data.get("temperature", DEFAULT_TEMPERATURE))
+            max_tokens = int(data.get("max_tokens", DEFAULT_MAX_TOKENS))
 
-            # ✅ Backward-compatible system/prompt extraction
-            system = (
-                data.get("system")
-                or data.get("prompt")
-                or data.get("promptText")
-                or data.get("prompt_text")
-                or "You are StatGPT, a helpful assistant for sports data insights."
+            # Attachments (new)
+            attachment_parts = _extract_attachments(data)
+            has_attachments = len(attachment_parts) > 0
+
+            # If they didn't send messages, accept "prompt" or "text" fields
+            if not messages:
+                prompt = data.get("prompt") or data.get("text") or ""
+                if prompt:
+                    messages = [{"role": "user", "content": prompt}]
+
+            refined_system = (
+                system
+                + "\n\n"
+                + "Guidelines:\n"
+                + "- Answer like a helpful sports analyst.\n"
+                + "- If an image is provided, you CAN analyze it (including reading text in it).\n"
+                + "- Keep it concise. Use bullets when helpful.\n"
+                + "- Do not mention internal tools or infrastructure.\n"
             )
 
-            model = data.get("model") or MODEL
+            # Build Responses API input messages
+            input_msgs = []
 
-            if not msg:
-                body = json.dumps({"error": "message is required"}).encode()
-                self.send_response(400)
-            else:
-                # Load compiled JSON (no truncation)
-                compiled = {}
-                source_mode = "none"
-                error_compiled = None
-                try:
-                    compiled, source_mode = load_compiled(data)
-                except ValueError as e:
-                    error_compiled = str(e)
+            # system message first
+            input_msgs.append(
+                {
+                    "role": "system",
+                    "content": [{"type": "input_text", "text": refined_system}],
+                }
+            )
 
-                if error_compiled:
-                    # You can choose to hard fail OR proceed without compiled context.
-                    body = json.dumps({"error": "compiled load failed", "detail": error_compiled}).encode()
-                    self.send_response(400)
+            # normalize provided messages
+            normalized = []
+            for m in messages:
+                if not isinstance(m, dict):
+                    continue
+                role = (m.get("role") or "user").strip()
+                content = m.get("content")
+                parts = _coerce_to_input_parts(content)
+                normalized.append({"role": role, "content": parts})
+
+            # If we have attachments, append them to the last user message (or add a user message)
+            if has_attachments:
+                # prefer using a vision-capable model if configured
+                model = DEFAULT_VISION_MODEL
+
+                # find last user msg
+                idx = None
+                for i in range(len(normalized) - 1, -1, -1):
+                    if normalized[i].get("role") == "user":
+                        idx = i
+                        break
+
+                if idx is None:
+                    normalized.append(
+                        {
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "Analyze the attached image(s)."}]
+                            + attachment_parts,
+                        }
+                    )
                 else:
-                    # Build a refined system context (no huge inline JSON)
-                    summary = summarize_compiled(compiled)
-                    refined_system = (
-                        f"{system}\n\n"
-                        f"Compiled Source Mode: {source_mode}\n"
-                        f"Structured Summary:\n{summary}\n\n"
-                        f"IMPORTANT:\nUse only the summarized structure plus the internal parsed data you have (not shown entirely here) for factual reasoning. "
-                        f"Do NOT hallucinate beyond available sections and meta.\n"
-                    )
+                    normalized[idx]["content"] = (normalized[idx].get("content") or []) + attachment_parts
 
-                    # Create chat completion
-                    completion = client.chat.completions.create(
-                        model=model,
-                        messages=[
-                            {"role": "system", "content": refined_system},
-                            {"role": "user", "content": msg},
-                        ],
-                    )
+            input_msgs.extend(normalized)
 
-                    reply = (completion.choices[0].message.content or "").strip()
-                    body = json.dumps({
-                        "reply": reply,
+            # Call OpenAI (Responses API so vision works)
+            resp = client.responses.create(
+                model=model,
+                input=input_msgs,
+                temperature=temperature,
+                max_output_tokens=max_tokens,
+            )
+
+            reply_text = getattr(resp, "output_text", None) or ""
+            usage = getattr(resp, "usage", None)
+            usage_dict = None
+            if usage:
+                # best-effort serialization
+                usage_dict = {}
+                for k in ("input_tokens", "output_tokens", "total_tokens"):
+                    if hasattr(usage, k):
+                        usage_dict[k] = getattr(usage, k)
+
+            self._set_headers(200, "application/json")
+            self.wfile.write(
+                json.dumps(
+                    {
+                        "reply": reply_text,
+                        "usage": usage_dict,
                         "model": model,
-                        "sourceMode": source_mode,
-                        "hasMeta": bool(compiled.get("meta")),
-                        "sectionsCount": len(compiled.get("sections", {}) or {}),
-                    }).encode()
-                    self.send_response(200)
+                        "has_attachments": has_attachments,
+                    }
+                ).encode("utf-8")
+            )
 
         except Exception as e:
-            body = json.dumps({"error": "server error", "detail": str(e)}).encode()
-            self.send_response(500)
-
-        for k, v in _cors_headers(origin).items():
-            self.send_header(k, v)
-        self.send_header("content-length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+            self._set_headers(500, "application/json")
+            self.wfile.write(json.dumps({"error": str(e)}).encode("utf-8"))
