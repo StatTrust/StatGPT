@@ -241,6 +241,9 @@ class Handler(BaseHTTPRequestHandler):
             temperature = float(data.get("temperature", DEFAULT_TEMPERATURE))
             max_tokens = int(data.get("max_tokens", DEFAULT_MAX_TOKENS))
 
+            mode = (data.get("mode") or "").strip().lower()
+            is_extract = mode in ("extract", "slip_extract", "vision_extract")
+
             # Attachments (new)
             attachment_parts = _extract_attachments(data)
             has_attachments = len(attachment_parts) > 0
@@ -251,15 +254,21 @@ class Handler(BaseHTTPRequestHandler):
                 if prompt:
                     messages = [{"role": "user", "content": prompt}]
 
-            refined_system = (
-                system
-                + "\n\n"
-                + "Guidelines:\n"
-                + "- Answer like a helpful sports analyst.\n"
-                + "- If an image is provided, you CAN analyze it (including reading text in it).\n"
-                + "- Keep it concise. Use bullets when helpful.\n"
-                + "- Do not mention internal tools or infrastructure.\n"
-            )
+            # For extract mode, do NOT append the generic "Guidelines" block.
+            # That block encourages descriptive answers and can break JSON-only extraction.
+            if is_extract:
+                refined_system = system
+                temperature = 0.0  # optional but recommended for deterministic extraction
+            else:
+                refined_system = (
+                    system
+                    + "\n\n"
+                    + "Guidelines:\n"
+                    + "- Answer like a helpful sports analyst.\n"
+                    + "- If an image is provided, you CAN analyze it (including reading text in it).\n"
+                    + "- Keep it concise. Use bullets when helpful.\n"
+                    + "- Do not mention internal tools or infrastructure.\n"
+                )
 
             # Build Responses API input messages
             input_msgs = []
@@ -298,7 +307,14 @@ class Handler(BaseHTTPRequestHandler):
                     normalized.append(
                         {
                             "role": "user",
-                            "content": [{"type": "input_text", "text": "Analyze the attached image(s)."}]
+                            "content": [{
+                                "type": "input_text",
+                                "text": (
+                                    "Extract the betting slip into structured fields. Return ONLY the extracted fields; no commentary."
+                                    if is_extract else
+                                    "Analyze the attached image(s)."
+                                )
+                            }]
                             + attachment_parts,
                         }
                     )
