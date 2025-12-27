@@ -247,7 +247,7 @@ class Handler(BaseHTTPRequestHandler):
 
             # If they didn't send messages, accept "prompt" or "text" fields
             if not messages:
-                prompt = data.get("prompt") or data.get("text") or ""
+                prompt = data.get("prompt") or data.get("text") or data.get("userMessage") or data.get("message") or ""
                 if prompt:
                     messages = [{"role": "user", "content": prompt}]
 
