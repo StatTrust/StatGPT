@@ -248,9 +248,15 @@ class Handler(BaseHTTPRequestHandler):
             attachment_parts = _extract_attachments(data)
             has_attachments = len(attachment_parts) > 0
 
-            # If they didn't send messages, accept "prompt" or "text" fields
+            # If they didn't send messages, accept "message/userMessage/prompt/text" fields
             if not messages:
-                prompt = data.get("prompt") or data.get("text") or data.get("userMessage") or data.get("message") or ""
+                prompt = (
+                    data.get("message")
+                    or data.get("userMessage")
+                    or data.get("prompt")
+                    or data.get("text")
+                    or ""
+                )
                 if prompt:
                     messages = [{"role": "user", "content": prompt}]
 
