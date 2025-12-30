@@ -260,6 +260,24 @@ class Handler(BaseHTTPRequestHandler):
                 if prompt:
                     messages = [{"role": "user", "content": prompt}]
 
+            # ---- Inject compiled stats + slip JSON if present ----
+            compiled_inline = data.get("compiledInline") or data.get("compiledText") or None
+            if isinstance(compiled_inline, (dict, list)):
+                compiled_inline = json.dumps(compiled_inline, ensure_ascii=False)
+
+            slip_raw = data.get("slipRaw") or data.get("slip") or None
+            if isinstance(slip_raw, (dict, list)):
+                slip_raw = json.dumps(slip_raw, ensure_ascii=False)
+
+            if compiled_inline:
+                system += "\n\nCOMPILED_STATS_JSON:\n" + str(compiled_inline)
+
+            if slip_raw:
+                system += "\n\nSLIP_EXTRACT_JSON:\n" + str(slip_raw)
+
+            if mode == "extract":
+                system += "\n\nReturn ONLY valid JSON. No markdown. No extra text."
+
             # For extract mode, do NOT append the generic "Guidelines" block.
             # That block encourages descriptive answers and can break JSON-only extraction.
             if is_extract:
