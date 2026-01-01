@@ -1,6 +1,7 @@
 # api/chat.py
 import os
 import json
+import re
 from http.server import BaseHTTPRequestHandler
 from urllib.parse import urlparse
 
@@ -188,6 +189,46 @@ def _extract_attachments(data: dict):
     return parts
 
 
+def normalize_confidence(reply: str) -> str:
+    """
+    Ensures the reply always ends with:
+      - Signal: ...
+      - Confidence: NN%
+    
+    Converts Low/Medium/High to percentages if the model outputs those instead.
+    """
+    if not reply:
+        return reply
+
+    # If it already has Confidence: XX%
+    if re.search(r"Confidence:\s*\d{1,3}\s*%", reply, re.I):
+        return reply
+
+    # Convert common words to a default %
+    m = re.search(r"Confidence:\s*(Low|Medium|High|Very\s*Low|Very\s*High)", reply, re.I)
+    if m:
+        word = m.group(1).lower().replace(" ", "")
+        mapping = {
+            "verylow": "25%",
+            "low": "40%",
+            "medium": "60%",
+            "high": "75%",
+            "veryhigh": "85%",
+        }
+        pct = mapping.get(word, "60%")
+        reply = re.sub(r"Confidence:\s*(Low|Medium|High|Very\s*Low|Very\s*High)\b", f"Confidence: {pct}", reply, flags=re.I)
+
+    # If it somehow omitted Confidence entirely, append it
+    if "Confidence:" not in reply:
+        reply = reply.rstrip() + "\n\nConfidence: 60%"
+
+    # If it omitted Signal, append a placeholder (optional)
+    if "Signal:" not in reply:
+        reply = reply.rstrip() + "\n\nSignal: See notes above"
+
+    return reply
+
+
 class Handler(BaseHTTPRequestHandler):
     def _set_headers(self, status=200, content_type="application/json"):
         self.send_response(status)
@@ -356,6 +397,10 @@ class Handler(BaseHTTPRequestHandler):
             )
 
             reply_text = getattr(resp, "output_text", None) or ""
+            
+            # Normalize confidence to ensure it's always a percentage
+            reply_text = normalize_confidence(reply_text)
+            
             usage = getattr(resp, "usage", None)
             usage_dict = None
             if usage:
