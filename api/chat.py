@@ -191,41 +191,64 @@ def _extract_attachments(data: dict):
 
 def normalize_confidence(reply: str) -> str:
     """
-    Ensures the reply always ends with:
-      - Signal: ...
-      - Confidence: NN%
-    
-    Converts Low/Medium/High to percentages if the model outputs those instead.
+    Ensures the reply includes a final:
+      Signal: ...
+      Confidence: Low/Medium/High (NN%) ...
+
+    IMPORTANT:
+    - Do NOT get tricked by "Leg Confidence: 75%" lines.
+    - Only treat a line that STARTS with Confidence: (optionally bolded) as the final confidence line.
     """
     if not reply:
         return reply
 
-    # If it already has Confidence: XX%
-    if re.search(r"Confidence:\s*\d{1,3}\s*%", reply, re.I):
-        return reply
-
-    # Convert common words to a default %
-    m = re.search(r"Confidence:\s*(Low|Medium|High|Very\s*Low|Very\s*High)", reply, re.I)
-    if m:
-        word = m.group(1).lower().replace(" ", "")
-        mapping = {
-            "verylow": "25%",
-            "low": "40%",
-            "medium": "60%",
-            "high": "75%",
-            "veryhigh": "85%",
-        }
-        pct = mapping.get(word, "60%")
-        reply = re.sub(r"Confidence:\s*(Low|Medium|High|Very\s*Low|Very\s*High)\b", f"Confidence: {pct}", reply, flags=re.I)
-
-    # If it somehow omitted Confidence entirely, append it
-    if "Confidence:" not in reply:
-        reply = reply.rstrip() + "\n\nConfidence: 60%"
-
-    # If it omitted Signal, append a placeholder (optional)
-    if "Signal:" not in reply:
+    # Ensure Signal exists somewhere (prefer line-start, optionally bolded)
+    if not re.search(r"(?mi)^\s*(?:\*\*)?Signal(?:\*\*)?:\s*", reply):
         reply = reply.rstrip() + "\n\nSignal: See notes above"
 
+    # Match ONLY line-start Confidence (optionally bolded), so we ignore "Leg Confidence:"
+    conf_re = re.compile(
+        r"(?mi)^(?P<prefix>\s*(?:\*\*)?Confidence(?:\*\*)?:\s*)(?P<body>.+)$"
+    )
+    matches = list(conf_re.finditer(reply))
+
+    # If Confidence line is missing entirely, append a sensible default
+    if not matches:
+        reply = reply.rstrip() + "\nConfidence: Medium (60%)"
+        return reply
+
+    last = matches[-1]
+    prefix = last.group("prefix")
+    body = last.group("body").strip()
+
+    # If final Confidence already has a %, leave it alone
+    # (this is ONLY the final line-start Confidence, not per-leg)
+    if re.search(r"\d{1,3}\s*%", body):
+        return reply
+
+    # Map tiers -> default % if model omitted the percent
+    mapping = {
+        "verylow": "25%",
+        "low": "40%",
+        "medium": "60%",
+        "high": "75%",
+        "veryhigh": "85%",
+    }
+
+    # If body starts with a tier word, inject "(NN%)" right after it, preserving the rest (e.g. "– blah blah")
+    m = re.match(r"(Very\s*Low|Low|Medium|High|Very\s*High)\b(?P<tail>.*)$", body, re.I)
+    if m:
+        tier = m.group(1)
+        tail = m.group("tail") or ""
+        key = tier.lower().replace(" ", "")
+        pct = mapping.get(key, "60%")
+        new_line = f"{prefix}{tier} ({pct}){tail}"
+    else:
+        # Fallback if it's some weird format
+        new_line = f"{prefix}{body} (60%)"
+
+    # Replace ONLY the final confidence line
+    reply = reply[: last.start()] + new_line + reply[last.end() :]
     return reply
 
 
