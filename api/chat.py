@@ -2,6 +2,8 @@
 import os
 import json
 import re
+import urllib.request
+import urllib.parse
 from http.server import BaseHTTPRequestHandler
 from urllib.parse import urlparse
 
@@ -43,6 +45,41 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 def _safe_json_loads(s: str):
     try:
         return json.loads(s)
+    except Exception:
+        return None
+
+
+def _get_kv_rest_config():
+    """
+    Supports both Upstash and Vercel KV env var names.
+    Returns (rest_url, token) or (None, None).
+    """
+    candidates = [
+        ("UPSTASH_REDIS_REST_URL", "UPSTASH_REDIS_REST_TOKEN"),
+        ("KV_REST_API_URL", "KV_REST_API_TOKEN"),
+    ]
+    for url_k, tok_k in candidates:
+        rest_url = (os.environ.get(url_k) or "").strip().rstrip("/")
+        token = (os.environ.get(tok_k) or "").strip()
+        if rest_url and token:
+            return rest_url, token
+    return None, None
+
+
+def _kv_hget(rest_url: str, token: str, key: str, field: str):
+    try:
+        k = urllib.parse.quote(str(key), safe="")
+        f = urllib.parse.quote(str(field), safe="")
+        url = f"{rest_url}/hget/{k}/{f}"
+        req = urllib.request.Request(
+            url,
+            headers={"Authorization": f"Bearer {token}"},
+            method="GET",
+        )
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            raw = resp.read().decode("utf-8", errors="ignore")
+        data = _safe_json_loads(raw) or {}
+        return data.get("result")
     except Exception:
         return None
 
@@ -328,6 +365,20 @@ class Handler(BaseHTTPRequestHandler):
             compiled_inline = data.get("compiledInline") or data.get("compiledText") or None
             if isinstance(compiled_inline, (dict, list)):
                 compiled_inline = json.dumps(compiled_inline, ensure_ascii=False)
+
+            # ✅ NEW: if compiledInline is missing, try compiledPointer (stored in KV as a hash with field "blob")
+            if not compiled_inline:
+                compiled_ptr = data.get("compiledPointer") or data.get("compiled_pointer") or None
+                if isinstance(compiled_ptr, str) and compiled_ptr.strip():
+                    rest_url, token = _get_kv_rest_config()
+                    if not rest_url or not token:
+                        raise Exception("compiledPointer provided but KV REST credentials are missing (set UPSTASH_REDIS_REST_URL/TOKEN or KV_REST_API_URL/TOKEN).")
+
+                    blob = _kv_hget(rest_url, token, compiled_ptr.strip(), "blob")
+                    if not blob:
+                        raise Exception(f"compiledPointer provided but blob not found in KV (key={compiled_ptr}).")
+
+                    compiled_inline = blob
 
             slip_raw = data.get("slipRaw") or data.get("slip") or None
             if isinstance(slip_raw, (dict, list)):
