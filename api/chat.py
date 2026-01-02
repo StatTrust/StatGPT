@@ -67,6 +67,10 @@ def _get_kv_rest_config():
 
 
 def _kv_hget(rest_url: str, token: str, key: str, field: str):
+    """
+    Calls Upstash REST: GET {REST_URL}/hget/{key}/{field}
+    Returns the 'result' value (usually a string) or None.
+    """
     try:
         k = urllib.parse.quote(str(key), safe="")
         f = urllib.parse.quote(str(field), safe="")
